@@ -1,0 +1,1201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="robots" content="noindex, nofollow" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Training Log" />
+<meta name="theme-color" content="#0E1218" />
+<title>Training Log</title>
+<style>html,body{height:100%;margin:0;background:#0E1218;}#root{min-height:100%;}</style>
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } = Recharts;
+
+/* ============================================================
+   Harin — Training Tracker
+   Data model persisted to window.storage under one key.
+   Design: "instrument panel" — data-forward, protect-the-lift.
+   ============================================================ */
+
+const STORAGE_KEY = "harin-tracker-v1";
+
+/* ---------- Exercise templates (from plan PDF) ---------- */
+const SESSIONS = {
+  A: {
+    label: "Resistance A",
+    sub: "Squat emphasis",
+    accent: "load",
+    exercises: [
+      { key: "a_squat", slot: "Squat pattern", onramp: "Goblet / leg press", barbell: "Back squat", sets: 3, repTop: 12, repLabel: "8–12" },
+      { key: "a_hpush", slot: "Horizontal push", onramp: "DB bench / machine", barbell: "Bench press", sets: 3, repTop: 12, repLabel: "8–12" },
+      { key: "a_hpull", slot: "Horizontal pull", onramp: "One-arm DB row", barbell: "Row", sets: 3, repTop: 12, repLabel: "10–12 ea" },
+      { key: "a_hinge", slot: "Hip thrust", onramp: "Glute bridge / DB thrust", barbell: "Barbell hip thrust", sets: 3, repTop: 15, repLabel: "12–15" },
+      { key: "a_reardelt", slot: "Rear delt", onramp: "Face pull", barbell: "Face pull", sets: 2, repTop: 15, repLabel: "15" },
+      { key: "a_core", slot: "Core", onramp: "Plank", barbell: "Plank", sets: 3, repTop: 45, repLabel: "30–45s", time: true },
+    ],
+  },
+  B: {
+    label: "Resistance B",
+    sub: "Hinge emphasis",
+    accent: "load",
+    exercises: [
+      { key: "b_rdl", slot: "Hip hinge", onramp: "DB RDL", barbell: "Barbell RDL", sets: 3, repTop: 12, repLabel: "8–12" },
+      { key: "b_vpush", slot: "Vertical push", onramp: "DB OHP (seated)", barbell: "Barbell OHP", sets: 3, repTop: 12, repLabel: "8–12" },
+      { key: "b_vpull", slot: "Vertical pull", onramp: "Lat pulldown", barbell: "Lat pulldown", sets: 3, repTop: 12, repLabel: "10–12" },
+      { key: "b_singleleg", slot: "Single-leg", onramp: "Split squat (BW→DB)", barbell: "Bulgarian split sq", sets: 3, repTop: 10, repLabel: "10 ea" },
+      { key: "b_arms", slot: "Arms", onramp: "DB curl + tricep pushdown", barbell: "same", sets: 2, repTop: 12, repLabel: "12" },
+      { key: "b_core", slot: "Core", onramp: "Side plank", barbell: "Side plank", sets: 3, repTop: 30, repLabel: "30s ea", time: true },
+    ],
+  },
+};
+const EX_INDEX = Object.fromEntries(
+  Object.values(SESSIONS).flatMap((s) => s.exercises.map((e) => [e.key, e]))
+);
+
+/* ---------- Date helpers ---------- */
+const iso = (d) => {
+  const z = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+  return z.toISOString().slice(0, 10);
+};
+const todayISO = () => iso(new Date());
+function weekStart(dateStr) {
+  const d = new Date(dateStr + "T00:00:00");
+  const day = (d.getDay() + 6) % 7; // Mon=0
+  d.setDate(d.getDate() - day);
+  return iso(d);
+}
+const fmtShort = (dateStr) =>
+  new Date(dateStr + "T00:00:00").toLocaleDateString(undefined, { day: "numeric", month: "short" });
+const fmtWeekday = (dateStr) =>
+  new Date(dateStr + "T00:00:00").toLocaleDateString(undefined, { weekday: "short" });
+
+/* ---------- Storage ----------
+   Adapter: prefers artifact window.storage; falls back to IndexedDB for
+   standalone builds (no practical size cap, async/non-blocking); no-op if
+   neither exists. In the Claude artifact runtime window.storage is present,
+   so the IndexedDB branch is never reached there. */
+const emptyState = () => ({ version: 1, sessions: [], walks: {} });
+
+const IDB_NAME = "harin-tracker";
+const IDB_STORE = "kv";
+let _idb; // cached connection promise — avoid reopen per read/write
+function idbOpen() {
+  if (_idb) return _idb;
+  _idb = new Promise((resolve, reject) => {
+    const req = window.indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return _idb;
+}
+async function idbReq(mode, fn) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const req = fn(db.transaction(IDB_STORE, mode).objectStore(IDB_STORE));
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function storageGet(key) {
+  if (typeof window === "undefined") return null;
+  if (window.storage) {
+    const r = await window.storage.get(key); // throws if key absent → caught upstream
+    return r?.value ?? null;
+  }
+  if (window.indexedDB) {
+    try {
+      return (await idbReq("readonly", (s) => s.get(key))) ?? null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+async function storageSet(key, val) {
+  if (typeof window === "undefined") return;
+  if (window.storage) {
+    await window.storage.set(key, val);
+    return;
+  }
+  if (window.indexedDB) {
+    try {
+      await idbReq("readwrite", (s) => s.put(val, key));
+    } catch (e) {
+      console.error("persist failed", e);
+    }
+  }
+}
+
+async function loadState() {
+  try {
+    const raw = await storageGet(STORAGE_KEY);
+    if (raw) return { ...emptyState(), ...JSON.parse(raw) };
+  } catch (e) {
+    /* key absent / invalid JSON → default */
+  }
+  return emptyState();
+}
+async function persist(state) {
+  try {
+    await storageSet(STORAGE_KEY, JSON.stringify(state));
+  } catch (e) {
+    console.error("persist failed", e);
+  }
+}
+
+/* ---------- Analytics ---------- */
+function topSet(entry) {
+  if (!entry?.sets?.length) return null;
+  return entry.sets.reduce((best, s) => {
+    if (!best) return s;
+    if ((s.w || 0) > (best.w || 0)) return s;
+    if ((s.w || 0) === (best.w || 0) && (s.reps || 0) > (best.reps || 0)) return s;
+    return best;
+  }, null);
+}
+const est1RM = (w, reps) => (w > 0 && reps > 0 ? Math.round(w * (1 + reps / 30)) : 0);
+function sessionVolume(sess) {
+  if (sess.type === "squash") return 0;
+  return (sess.entries || []).reduce(
+    (t, e) => t + (e.sets || []).reduce((x, s) => x + (s.w || 0) * (s.reps || 0), 0),
+    0
+  );
+}
+// Ready to progress: latest logged instance, all sets ≥ repTop, max RPE ≤ 8
+function readyToProgress(sessions, exKey) {
+  const meta = EX_INDEX[exKey];
+  if (!meta || meta.time) return false;
+  for (let i = sessions.length - 1; i >= 0; i--) {
+    const e = (sessions[i].entries || []).find((x) => x.key === exKey && x.sets?.some((s) => s.reps));
+    if (e) {
+      const sets = e.sets.filter((s) => s.reps);
+      return sets.every((s) => (s.reps || 0) >= meta.repTop && (s.rpe || 0) <= 8) && sets.length > 0;
+    }
+  }
+  return false;
+}
+function walkStreak(walks) {
+  let n = 0;
+  const d = new Date();
+  // allow "today not yet done" without breaking streak
+  if (!walks[iso(d)]) d.setDate(d.getDate() - 1);
+  for (;;) {
+    if (walks[iso(d)] > 0) {
+      n++;
+      d.setDate(d.getDate() - 1);
+    } else break;
+  }
+  return n;
+}
+
+/* ---------- Weekly adherence tier ---------- */
+const TIERS = {
+  empty: { name: "No sessions", color: "var(--dim)", note: "Log Resistance A first — it hits everything." },
+  minimum: { name: "Minimum viable", color: "#8A94A3", note: "Res A in. Now protect Res B for the floor." },
+  floor: { name: "Floor", color: "var(--load)", note: "Core intact. Both lifts done — week is safe." },
+  complete: { name: "Complete", color: "var(--cardio)", note: "Lifts + squash. Solid week." },
+  ideal: { name: "Ideal", color: "var(--walk)", note: "Full stack. Everything the plan asks for." },
+};
+function weekStats(sessions, refISO) {
+  const ws = weekStart(refISO);
+  const inWeek = sessions.filter((s) => weekStart(s.date) === ws);
+  const hasA = inWeek.some((s) => s.type === "A");
+  const hasB = inWeek.some((s) => s.type === "B");
+  const squash = inWeek.filter((s) => s.type === "squash").length;
+  let tier = "empty";
+  if (hasA && hasB && squash >= 2) tier = "ideal";
+  else if (hasA && hasB && squash >= 1) tier = "complete";
+  else if (hasA && hasB) tier = "floor";
+  else if (hasA || hasB) tier = "minimum";
+  return { ws, hasA, hasB, squash, tier, resVolume: inWeek.reduce((t, s) => t + sessionVolume(s), 0) };
+}
+
+/* ============================================================
+   ROOT
+   ============================================================ */
+function App() {
+  const [state, setState] = useState(null);
+  const [tab, setTab] = useState("today");
+  const [logType, setLogType] = useState(null); // 'A' | 'B' | 'squash'
+
+  useEffect(() => {
+    loadState().then(setState);
+  }, []);
+  // NOTE: no reactive persist-on-state effect. A failed/empty load must never
+  // be echoed back over good stored data. Writes happen only on real mutations.
+
+  if (!state) return <Splash />;
+
+  // Single mutation channel: apply → set → persist the exact next state.
+  const commit = (next) => {
+    setState(next);
+    persist(next);
+  };
+
+  const saveSession = (sess) => {
+    commit({
+      ...state,
+      sessions: [...state.sessions, sess].sort((a, b) => a.date.localeCompare(b.date)),
+    });
+    setLogType(null);
+    setTab("today");
+  };
+  const deleteSession = (id) =>
+    commit({ ...state, sessions: state.sessions.filter((x) => x.id !== id) });
+  const bumpWalk = (delta) => {
+    const t = todayISO();
+    const n = Math.max(0, (state.walks[t] || 0) + delta);
+    const walks = { ...state.walks };
+    if (n === 0) delete walks[t];
+    else walks[t] = n;
+    commit({ ...state, walks });
+  };
+
+  return (
+    <>
+      <Style />
+      <div className="app">
+        <Header state={state} onImport={commit} />
+        <main className="main">
+          {tab === "today" && <Today state={state} onStart={setLogType} bumpWalk={bumpWalk} />}
+          {tab === "progress" && <Progress state={state} />}
+          {tab === "history" && <History state={state} onDelete={deleteSession} />}
+        </main>
+        <Nav tab={tab} setTab={setTab} />
+        {logType && (
+          <Logger type={logType} state={state} onSave={saveSession} onCancel={() => setLogType(null)} />
+        )}
+      </div>
+    </>
+  );
+}
+
+function Splash() {
+  return (
+    <>
+      <Style />
+      <div className="app splash">
+        <div className="pulse">loading log…</div>
+      </div>
+    </>
+  );
+}
+
+/* ============================================================
+   HEADER  (title + data menu)
+   ============================================================ */
+function Header({ state, onImport }) {
+  const [open, setOpen] = useState(false);
+  const fileRef = useRef();
+
+  const exportData = () => {
+    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `training-log-${todayISO()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setOpen(false);
+  };
+  const importData = (e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        if (parsed && Array.isArray(parsed.sessions)) {
+          onImport({ ...emptyState(), ...parsed });
+          setOpen(false);
+        } else alert("That file doesn't look like a tracker export.");
+      } catch {
+        alert("Couldn't read that file — invalid JSON.");
+      }
+    };
+    reader.readAsText(f);
+    e.target.value = "";
+  };
+
+  return (
+    <header className="header">
+      <div className="brand">
+        <span className="brand-mark" />
+        <div>
+          <div className="brand-title">TRAINING LOG</div>
+          <div className="brand-sub">resistance + squash</div>
+        </div>
+      </div>
+      <div className="menu-wrap">
+        <button className="icon-btn" onClick={() => setOpen((o) => !o)} aria-label="Data menu">⋯</button>
+        {open && (
+          <div className="menu">
+            <button onClick={exportData}>Export data (.json)</button>
+            <button onClick={() => fileRef.current?.click()}>Import data</button>
+            <input ref={fileRef} type="file" accept="application/json" onChange={importData} hidden />
+          </div>
+        )}
+      </div>
+    </header>
+  );
+}
+
+/* ============================================================
+   TODAY  — hero tier gauge + quick log + walks
+   ============================================================ */
+function Today({ state, onStart, bumpWalk }) {
+  const wk = useMemo(() => weekStats(state.sessions, todayISO()), [state.sessions]);
+  const streak = useMemo(() => walkStreak(state.walks), [state.walks]);
+  const walksToday = state.walks[todayISO()] || 0;
+  const tier = TIERS[wk.tier];
+
+  return (
+    <div className="stack">
+      <TierGauge wk={wk} tier={tier} />
+
+      <section className="card">
+        <div className="card-eyebrow">This week · protect the lift</div>
+        <div className="slots">
+          <Slot label="Res A" done={wk.hasA} protect accent="load" />
+          <Slot label="Res B" done={wk.hasB} protect accent="load" />
+          <Slot label="Squash" done={wk.squash >= 1} accent="cardio" count={wk.squash} />
+        </div>
+      </section>
+
+      <section className="card">
+        <div className="card-eyebrow">Log a session</div>
+        <div className="start-grid">
+          <StartBtn accent="load" title="Resistance A" sub="Squat emphasis" onClick={() => onStart("A")} />
+          <StartBtn accent="load" title="Resistance B" sub="Hinge emphasis" onClick={() => onStart("B")} />
+          <StartBtn accent="cardio" title="Squash" sub="Interval cardio" onClick={() => onStart("squash")} wide />
+        </div>
+      </section>
+
+      <section className="card walk-card">
+        <div>
+          <div className="card-eyebrow" style={{ color: "var(--walk)" }}>Post-meal walks</div>
+          <div className="walk-meta">
+            <span className="walk-count mono">{walksToday}</span>
+            <span className="walk-lbl">today · target 2</span>
+          </div>
+          <div className="walk-streak mono">
+            {streak > 0 ? `${streak}-day streak` : "start a streak"}
+          </div>
+        </div>
+        <div className="walk-btns">
+          <button className="round" onClick={() => bumpWalk(-1)} disabled={walksToday === 0}>−</button>
+          <button className="round plus" onClick={() => bumpWalk(1)}>+</button>
+        </div>
+      </section>
+
+      <PlanFlags />
+    </div>
+  );
+}
+
+function TierGauge({ wk, tier }) {
+  // 4 rungs: Res A, Res B, Squash, Squash — protect logic colored
+  const rungs = [
+    { on: wk.hasA, c: "var(--load)", lbl: "A" },
+    { on: wk.hasB, c: "var(--load)", lbl: "B" },
+    { on: wk.squash >= 1, c: "var(--cardio)", lbl: "S" },
+    { on: wk.squash >= 2, c: "var(--cardio)", lbl: "S" },
+  ];
+  return (
+    <section className="gauge">
+      <div className="gauge-head">
+        <span className="gauge-eyebrow">Week status</span>
+        <span className="gauge-tier" style={{ color: tier.color }}>{tier.name}</span>
+      </div>
+      <div className="ladder">
+        {rungs.map((r, i) => (
+          <div
+            key={i}
+            className={`rung ${r.on ? "lit" : ""}`}
+            style={r.on ? { background: r.c, boxShadow: `0 0 14px ${r.c}66`, borderColor: r.c } : {}}
+          >
+            <span className="rung-lbl mono">{r.lbl}</span>
+          </div>
+        ))}
+      </div>
+      <div className="gauge-scale mono">
+        <span>MIN</span><span>FLOOR</span><span>COMPLETE</span><span>IDEAL</span>
+      </div>
+      <p className="gauge-note">{tier.note}</p>
+    </section>
+  );
+}
+
+function Slot({ label, done, protect, accent, count }) {
+  return (
+    <div className={`slot ${done ? "slot-done" : ""}`} style={done ? { borderColor: `var(--${accent})` } : {}}>
+      <span className="slot-dot" style={done ? { background: `var(--${accent})` } : {}} />
+      <span className="slot-lbl">{label}</span>
+      {count > 1 && <span className="slot-count mono">×{count}</span>}
+      {protect && <span className="slot-tag">protect</span>}
+    </div>
+  );
+}
+
+function StartBtn({ title, sub, onClick, accent, wide }) {
+  return (
+    <button className={`start-btn ${wide ? "wide" : ""}`} onClick={onClick} style={{ "--a": `var(--${accent})` }}>
+      <span className="start-title">{title}</span>
+      <span className="start-sub">{sub}</span>
+      <span className="start-arrow">→</span>
+    </button>
+  );
+}
+
+function PlanFlags() {
+  const flags = [
+    "Form > load, always. Detrained joints — ramp intensity, not ego.",
+    "1–2 slots left → keep Resistance, drop squash. Resistance is the priority.",
+    "Hydrate above instinct: intense work + high-normal Hb + higher protein.",
+    "HIIT / max-effort minimized until Hb cleared. Doctor's call.",
+  ];
+  return (
+    <section className="card flags">
+      <div className="card-eyebrow">Plan reminders</div>
+      <ul>
+        {flags.map((f, i) => (
+          <li key={i}>{f}</li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/* ============================================================
+   LOGGER
+   ============================================================ */
+function lastEntry(sessions, exKey) {
+  for (let i = sessions.length - 1; i >= 0; i--) {
+    const e = (sessions[i].entries || []).find((x) => x.key === exKey);
+    if (e && e.sets?.some((s) => s.w || s.reps)) return e;
+  }
+  return null;
+}
+
+function Logger({ type, state, onSave, onCancel }) {
+  if (type === "squash") return <SquashLogger state={state} onSave={onSave} onCancel={onCancel} />;
+  const cfg = SESSIONS[type];
+
+  const initial = cfg.exercises.map((ex) => {
+    const prev = lastEntry(state.sessions, ex.key);
+    const phase = prev?.phase || "onramp";
+    const sets = Array.from({ length: ex.sets }, (_, i) => {
+      const p = prev?.sets?.[i];
+      return { w: p?.w ?? "", reps: p?.reps ?? "", rpe: p?.rpe ?? "" };
+    });
+    return { key: ex.key, phase, sets, prev };
+  });
+
+  const [entries, setEntries] = useState(initial);
+  const [date, setDate] = useState(todayISO());
+
+  const setPhase = (i, phase) => setEntries((e) => e.map((x, j) => (j === i ? { ...x, phase } : x)));
+  const setField = (i, si, field, val) =>
+    setEntries((e) =>
+      e.map((x, j) =>
+        j === i ? { ...x, sets: x.sets.map((s, k) => (k === si ? { ...s, [field]: val } : s)) } : x
+      )
+    );
+
+  const save = () => {
+    const cleaned = entries.map((en) => ({
+      key: en.key,
+      phase: en.phase,
+      sets: en.sets
+        .map((s) => ({ w: num(s.w), reps: num(s.reps), rpe: num(s.rpe) }))
+        .filter((s) => s.w || s.reps),
+    }));
+    if (!cleaned.some((e) => e.sets.length)) {
+      onCancel();
+      return;
+    }
+    onSave({ id: uid(), date, type, entries: cleaned });
+  };
+
+  return (
+    <Sheet title={cfg.label} sub={cfg.sub} onCancel={onCancel} onSave={save} date={date} setDate={setDate}>
+      {cfg.exercises.map((ex, i) => (
+        <ExerciseCard
+          key={ex.key}
+          ex={ex}
+          entry={entries[i]}
+          onPhase={(p) => setPhase(i, p)}
+          onField={(si, f, v) => setField(i, si, f, v)}
+        />
+      ))}
+    </Sheet>
+  );
+}
+
+function ExerciseCard({ ex, entry, onPhase, onField }) {
+  const name = ex.phase === "barbell" ? ex.barbell : ex.onramp;
+  const displayName = entry.phase === "barbell" ? ex.barbell : ex.onramp;
+  const prev = entry.prev;
+  const prevTop = prev ? topSet(prev) : null;
+
+  return (
+    <div className="ex-card">
+      <div className="ex-head">
+        <div>
+          <div className="ex-slot mono">{ex.slot}</div>
+          <div className="ex-name">{displayName}</div>
+        </div>
+        <div className="phase-toggle">
+          <button className={entry.phase === "onramp" ? "on" : ""} onClick={() => onPhase("onramp")}>On-ramp</button>
+          <button className={entry.phase === "barbell" ? "on" : ""} onClick={() => onPhase("barbell")}>Barbell</button>
+        </div>
+      </div>
+
+      <div className="ex-target mono">
+        target {ex.sets}×{ex.repLabel}
+        {prevTop && (
+          <span className="ex-prev">
+            · last {ex.time ? `${prevTop.reps}s` : `${prevTop.w || 0}kg × ${prevTop.reps || 0}`}
+            {prevTop.rpe ? ` @${prevTop.rpe}` : ""}
+          </span>
+        )}
+      </div>
+
+      <div className="sets">
+        <div className="set-row set-head mono">
+          <span>set</span>
+          {!ex.time && <span>kg</span>}
+          <span>{ex.time ? "sec" : "reps"}</span>
+          <span>rpe</span>
+        </div>
+        {entry.sets.map((s, si) => (
+          <div className="set-row" key={si}>
+            <span className="set-i mono">{si + 1}</span>
+            {!ex.time && (
+              <NumInput value={s.w} onChange={(v) => onField(si, "w", v)} placeholder="—" />
+            )}
+            <NumInput value={s.reps} onChange={(v) => onField(si, "reps", v)} placeholder="—" />
+            <NumInput value={s.rpe} onChange={(v) => onField(si, "rpe", v)} placeholder="—" max={10} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SquashLogger({ onSave, onCancel }) {
+  const [minutes, setMinutes] = useState("");
+  const [note, setNote] = useState("");
+  const [date, setDate] = useState(todayISO());
+  const save = () => onSave({ id: uid(), date, type: "squash", minutes: num(minutes), note });
+  return (
+    <Sheet title="Squash" sub="Interval cardio" onCancel={onCancel} onSave={save} date={date} setDate={setDate}>
+      <div className="ex-card">
+        <div className="ex-head">
+          <div className="ex-name">Session length</div>
+        </div>
+        <div className="squash-min">
+          <NumInput value={minutes} onChange={setMinutes} placeholder="45" big />
+          <span className="mono">minutes</span>
+        </div>
+        <textarea
+          className="note"
+          placeholder="Optional note — opponent, feel, energy…"
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+        />
+      </div>
+    </Sheet>
+  );
+}
+
+function Sheet({ title, sub, onCancel, onSave, date, setDate, children }) {
+  return (
+    <div className="sheet-scrim" onClick={onCancel}>
+      <div className="sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="sheet-head">
+          <button className="sheet-cancel" onClick={onCancel}>Cancel</button>
+          <div className="sheet-titles">
+            <div className="sheet-title">{title}</div>
+            <div className="sheet-sub mono">{sub}</div>
+          </div>
+          <button className="sheet-save" onClick={onSave}>Save</button>
+        </div>
+        <div className="sheet-date">
+          <label className="mono">date</label>
+          <input type="date" value={date} max={todayISO()} onChange={(e) => setDate(e.target.value)} />
+        </div>
+        <div className="sheet-body">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   PROGRESS
+   ============================================================ */
+function Progress({ state }) {
+  const logged = useMemo(() => {
+    const keys = new Set();
+    state.sessions.forEach((s) => (s.entries || []).forEach((e) => e.sets?.length && keys.add(e.key)));
+    return [...keys];
+  }, [state.sessions]);
+
+  const [exKey, setExKey] = useState(null);
+  const active = exKey && logged.includes(exKey) ? exKey : logged[0] || null;
+
+  const volData = useMemo(() => weeklyVolume(state.sessions), [state.sessions]);
+
+  if (!state.sessions.length) {
+    return <Empty title="No data yet" body="Log a session and your progression curves will build here." />;
+  }
+
+  return (
+    <div className="stack">
+      <section className="card">
+        <div className="card-eyebrow">Load progression</div>
+        {active ? (
+          <>
+            <select className="ex-select mono" value={active} onChange={(e) => setExKey(e.target.value)}>
+              {logged.map((k) => (
+                <option key={k} value={k}>
+                  {EX_INDEX[k]?.slot} — {shortName(k)}
+                </option>
+              ))}
+            </select>
+            <ProgressionChart sessions={state.sessions} exKey={active} />
+          </>
+        ) : (
+          <p className="muted-p">No weighted exercises logged yet.</p>
+        )}
+      </section>
+
+      <section className="card">
+        <div className="card-eyebrow">Weekly volume · kg lifted</div>
+        {volData.length ? (
+          <ResponsiveContainer width="100%" height={180}>
+            <BarChart data={volData} margin={{ top: 8, right: 4, left: -18, bottom: 0 }}>
+              <CartesianGrid stroke="#232B37" vertical={false} />
+              <XAxis dataKey="label" tick={axisTick} axisLine={false} tickLine={false} />
+              <YAxis tick={axisTick} axisLine={false} tickLine={false} width={44} />
+              <Tooltip content={<ChartTip unit="kg" />} cursor={{ fill: "#ffffff08" }} />
+              <Bar dataKey="vol" fill="var(--load)" radius={[3, 3, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        ) : (
+          <p className="muted-p">Volume shows once resistance sessions are logged.</p>
+        )}
+      </section>
+
+      <SquashProgress sessions={state.sessions} />
+
+      <ProgressReady state={state} logged={logged} />
+    </div>
+  );
+}
+
+function ProgressionChart({ sessions, exKey }) {
+  const meta = EX_INDEX[exKey];
+  const data = [];
+  sessions.forEach((s) => {
+    const e = (s.entries || []).find((x) => x.key === exKey);
+    if (!e) return;
+    const t = topSet(e);
+    if (!t) return;
+    data.push({
+      date: fmtShort(s.date),
+      value: meta.time ? t.reps || 0 : t.w || 0,
+      e1rm: meta.time ? 0 : est1RM(t.w || 0, t.reps || 0),
+      reps: t.reps,
+      w: t.w,
+      rpe: t.rpe,
+    });
+  });
+  if (data.length < 1) return <p className="muted-p">No sets logged for this movement yet.</p>;
+  const unit = meta.time ? "s" : "kg";
+  const first = data[0].value;
+  const last = data[data.length - 1].value;
+  const delta = last - first;
+
+  return (
+    <>
+      <div className="prog-readout">
+        <div>
+          <div className="ro-big mono">{last}<span className="ro-unit">{unit}</span></div>
+          <div className="ro-lbl">top set now</div>
+        </div>
+        <div className={`ro-delta mono ${delta > 0 ? "up" : delta < 0 ? "down" : ""}`}>
+          {delta > 0 ? "▲" : delta < 0 ? "▼" : "•"} {Math.abs(delta)}{unit}
+          <span className="ro-lbl"> since start</span>
+        </div>
+      </div>
+      <ResponsiveContainer width="100%" height={190}>
+        <LineChart data={data} margin={{ top: 8, right: 6, left: -18, bottom: 0 }}>
+          <CartesianGrid stroke="#232B37" vertical={false} />
+          <XAxis dataKey="date" tick={axisTick} axisLine={false} tickLine={false} />
+          <YAxis tick={axisTick} axisLine={false} tickLine={false} width={44} domain={["dataMin - 2", "dataMax + 2"]} />
+          <Tooltip content={<ChartTip unit={unit} detail />} cursor={{ stroke: "#ffffff20" }} />
+          <Line type="monotone" dataKey="value" stroke="var(--load)" strokeWidth={2.5}
+            dot={{ r: 3, fill: "var(--load)", strokeWidth: 0 }} activeDot={{ r: 5 }} />
+        </LineChart>
+      </ResponsiveContainer>
+    </>
+  );
+}
+
+function SquashProgress({ sessions }) {
+  const squash = useMemo(() => sessions.filter((s) => s.type === "squash"), [sessions]);
+  const data = useMemo(() => weeklySquash(sessions), [sessions]);
+  if (!squash.length) return null;
+
+  const totalMin = squash.reduce((t, s) => t + (s.minutes || 0), 0);
+  const hasMinutes = data.some((d) => d.min > 0);
+
+  return (
+    <section className="card">
+      <div className="card-eyebrow" style={{ color: "var(--cardio)" }}>Squash · cardio load</div>
+      <div className="prog-readout">
+        <div>
+          <div className="ro-big mono" style={{ color: "var(--cardio)" }}>
+            {squash.length}<span className="ro-unit">sess</span>
+          </div>
+          <div className="ro-lbl">logged</div>
+        </div>
+        <div className="ro-delta mono" style={{ color: "var(--cardio)" }}>
+          {totalMin}<span className="ro-lbl"> total min</span>
+        </div>
+      </div>
+      {hasMinutes ? (
+        <ResponsiveContainer width="100%" height={160}>
+          <BarChart data={data} margin={{ top: 8, right: 4, left: -18, bottom: 0 }}>
+            <CartesianGrid stroke="#232B37" vertical={false} />
+            <XAxis dataKey="label" tick={axisTick} axisLine={false} tickLine={false} />
+            <YAxis tick={axisTick} axisLine={false} tickLine={false} width={44} />
+            <Tooltip content={<ChartTip unit=" min" />} cursor={{ fill: "#ffffff08" }} />
+            <Bar dataKey="min" fill="var(--cardio)" radius={[3, 3, 0, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      ) : (
+        <p className="muted-p">Add minutes when logging squash to see weekly load.</p>
+      )}
+    </section>
+  );
+}
+
+function ProgressReady({ state, logged }) {
+  const ready = logged.filter((k) => readyToProgress(state.sessions, k));
+  if (!ready.length) return null;
+  return (
+    <section className="card ready">
+      <div className="card-eyebrow" style={{ color: "var(--walk)" }}>Ready to progress</div>
+      <p className="ready-sub">Last session hit top-of-range at RPE ≤8 — add load next time.</p>
+      <div className="ready-list">
+        {ready.map((k) => (
+          <div className="ready-chip mono" key={k}>
+            {shortName(k)}
+            <span className="ready-add">
+              +{["a_squat", "a_hinge", "b_rdl", "b_singleleg"].includes(k) ? "2.5" : "1.25–2.5"}kg
+            </span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/* ============================================================
+   HISTORY
+   ============================================================ */
+function History({ state, onDelete }) {
+  const [openId, setOpenId] = useState(null);
+  const sessions = [...state.sessions].reverse();
+  if (!sessions.length)
+    return <Empty title="No sessions logged" body="Your training history will appear here, newest first." />;
+
+  return (
+    <div className="stack">
+      {sessions.map((s) => {
+        const cfg = s.type === "squash" ? { label: "Squash", accent: "cardio" } : SESSIONS[s.type];
+        const open = openId === s.id;
+        const vol = sessionVolume(s);
+        return (
+          <div className="hist" key={s.id} style={{ "--a": `var(--${cfg.accent})` }}>
+            <button className="hist-head" onClick={() => setOpenId(open ? null : s.id)}>
+              <span className="hist-bar" />
+              <div className="hist-main">
+                <div className="hist-title">{cfg.label}</div>
+                <div className="hist-meta mono">
+                  {fmtWeekday(s.date)} {fmtShort(s.date)}
+                  {s.type === "squash"
+                    ? s.minutes ? ` · ${s.minutes} min` : ""
+                    : vol ? ` · ${vol.toLocaleString()} kg` : ""}
+                </div>
+              </div>
+              <span className="hist-caret">{open ? "▾" : "▸"}</span>
+            </button>
+            {open && (
+              <div className="hist-body">
+                {s.type === "squash" ? (
+                  <p className="hist-note">{s.note || "No note."}</p>
+                ) : (
+                  (s.entries || []).map((e) => {
+                    const meta = EX_INDEX[e.key];
+                    return (
+                      <div className="hist-ex" key={e.key}>
+                        <div className="hist-ex-name">
+                          {shortName(e.key)}
+                          <span className="hist-phase mono">{e.phase === "barbell" ? "BB" : "OR"}</span>
+                        </div>
+                        <div className="hist-sets mono">
+                          {e.sets.map((st, i) => (
+                            <span key={i}>
+                              {meta?.time ? `${st.reps}s` : `${st.w || 0}×${st.reps || 0}`}
+                              {st.rpe ? `@${st.rpe}` : ""}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+                <button className="hist-del" onClick={() => onDelete(s.id)}>Delete session</button>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ============================================================
+   SHARED SMALL PARTS
+   ============================================================ */
+function NumInput({ value, onChange, placeholder, max, big }) {
+  return (
+    <input
+      className={`num mono ${big ? "num-big" : ""}`}
+      type="number"
+      inputMode="numeric"
+      value={value}
+      placeholder={placeholder}
+      onChange={(e) => {
+        let v = e.target.value;
+        if (max && v !== "" && Number(v) > max) v = String(max);
+        onChange(v);
+      }}
+    />
+  );
+}
+function Empty({ title, body }) {
+  return (
+    <div className="empty">
+      <div className="empty-mark" />
+      <div className="empty-title">{title}</div>
+      <div className="empty-body">{body}</div>
+    </div>
+  );
+}
+function Nav({ tab, setTab }) {
+  const items = [
+    ["today", "Today"],
+    ["progress", "Progress"],
+    ["history", "History"],
+  ];
+  return (
+    <nav className="nav">
+      {items.map(([k, l]) => (
+        <button key={k} className={tab === k ? "nav-on" : ""} onClick={() => setTab(k)}>
+          {l}
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+function ChartTip({ active, payload, label, unit, detail }) {
+  if (!active || !payload?.length) return null;
+  const p = payload[0].payload;
+  return (
+    <div className="tip mono">
+      <div className="tip-date">{p.date || label}</div>
+      <div className="tip-val">{payload[0].value}{unit}</div>
+      {detail && p.w !== undefined && (
+        <div className="tip-detail">
+          {p.w ? `${p.w}kg × ${p.reps}` : `${p.reps}${unit}`}{p.rpe ? ` · RPE ${p.rpe}` : ""}
+          {p.e1rm ? ` · e1RM ${p.e1rm}` : ""}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------- utils ---------- */
+const num = (v) => (v === "" || v == null ? 0 : Number(v) || 0);
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+const shortName = (k) => {
+  const e = EX_INDEX[k];
+  return e ? e.onramp.split(" / ")[0] : k;
+};
+function weeklyVolume(sessions) {
+  const map = {};
+  sessions.forEach((s) => {
+    const v = sessionVolume(s);
+    if (!v) return;
+    const ws = weekStart(s.date);
+    map[ws] = (map[ws] || 0) + v;
+  });
+  return Object.keys(map)
+    .sort()
+    .slice(-8)
+    .map((ws) => ({ label: fmtShort(ws), vol: map[ws] }));
+}
+function weeklySquash(sessions) {
+  const map = {};
+  sessions.forEach((s) => {
+    if (s.type !== "squash") return;
+    const ws = weekStart(s.date);
+    if (!map[ws]) map[ws] = { min: 0, count: 0 };
+    map[ws].min += s.minutes || 0;
+    map[ws].count += 1;
+  });
+  return Object.keys(map)
+    .sort()
+    .slice(-8)
+    .map((ws) => ({ label: fmtShort(ws), min: map[ws].min, count: map[ws].count }));
+}
+const axisTick = { fill: "#6B7585", fontSize: 11, fontFamily: "JetBrains Mono, monospace" };
+
+/* ============================================================
+   STYLES
+   ============================================================ */
+function Style() {
+  return (
+    <style>{`
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap');
+    :root{
+      --ink:#0E1218; --panel:#171D27; --panel2:#1F2733; --line:#28313E;
+      --text:#EDF1F6; --muted:#98A2B0; --dim:#6B7585;
+      --load:#E9A23B; --cardio:#43C6D6; --walk:#79C57B; --alert:#E4573D;
+    }
+    *{box-sizing:border-box;}
+    .mono{font-family:'JetBrains Mono',monospace;}
+    .app{
+      font-family:'Inter',system-ui,sans-serif; background:var(--ink); color:var(--text);
+      min-height:100vh; max-width:520px; margin:0 auto; position:relative;
+      padding-bottom:76px;
+    }
+    .splash{display:flex;align-items:center;justify-content:center;min-height:100vh;}
+    .pulse{color:var(--dim);font-family:'JetBrains Mono',monospace;animation:blink 1.2s infinite;}
+    @keyframes blink{50%{opacity:.35;}}
+
+    /* header */
+    .header{display:flex;align-items:center;justify-content:space-between;
+      padding:18px 18px 10px; position:sticky;top:0;background:linear-gradient(var(--ink) 70%,transparent);z-index:20;}
+    .brand{display:flex;align-items:center;gap:11px;}
+    .brand-mark{width:11px;height:22px;border-radius:2px;
+      background:linear-gradient(var(--load),var(--cardio));box-shadow:0 0 12px #E9A23B55;}
+    .brand-title{font-family:'Space Grotesk';font-weight:700;letter-spacing:.14em;font-size:14px;}
+    .brand-sub{font-size:10.5px;color:var(--dim);letter-spacing:.05em;}
+    .menu-wrap{position:relative;}
+    .icon-btn{background:var(--panel);border:1px solid var(--line);color:var(--muted);
+      width:34px;height:34px;border-radius:9px;font-size:18px;cursor:pointer;line-height:1;}
+    .menu{position:absolute;right:0;top:40px;background:var(--panel2);border:1px solid var(--line);
+      border-radius:11px;padding:6px;display:flex;flex-direction:column;min-width:170px;z-index:30;
+      box-shadow:0 12px 30px #0008;}
+    .menu button{background:none;border:none;color:var(--text);text-align:left;padding:9px 11px;
+      border-radius:7px;font-size:13.5px;cursor:pointer;font-family:'Inter';}
+    .menu button:hover{background:#ffffff0d;}
+
+    .main{padding:4px 16px 24px;}
+    .stack{display:flex;flex-direction:column;gap:14px;}
+    .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px;}
+    .card-eyebrow{font-family:'JetBrains Mono';font-size:10.5px;letter-spacing:.16em;
+      text-transform:uppercase;color:var(--muted);margin-bottom:13px;}
+
+    /* gauge */
+    .gauge{background:linear-gradient(150deg,var(--panel2),var(--panel));
+      border:1px solid var(--line);border-radius:18px;padding:18px 18px 16px;}
+    .gauge-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:14px;}
+    .gauge-eyebrow{font-family:'JetBrains Mono';font-size:10.5px;letter-spacing:.16em;
+      text-transform:uppercase;color:var(--muted);}
+    .gauge-tier{font-family:'Space Grotesk';font-weight:700;font-size:20px;}
+    .ladder{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;}
+    .rung{height:52px;border-radius:10px;border:1px solid var(--line);background:var(--panel2);
+      display:flex;align-items:center;justify-content:center;transition:.35s;}
+    .rung-lbl{font-size:13px;font-weight:700;color:var(--dim);transition:.35s;}
+    .rung.lit .rung-lbl{color:var(--ink);}
+    .gauge-scale{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:7px;}
+    .gauge-scale span{font-size:8.5px;letter-spacing:.06em;color:var(--dim);text-align:center;}
+    .gauge-note{font-size:12.5px;color:var(--muted);margin:12px 0 0;line-height:1.45;}
+
+    /* slots */
+    .slots{display:flex;gap:9px;}
+    .slot{flex:1;border:1px solid var(--line);border-radius:11px;padding:11px 8px;
+      display:flex;flex-direction:column;align-items:center;gap:6px;background:var(--panel2);position:relative;}
+    .slot-dot{width:9px;height:9px;border-radius:50%;background:var(--dim);transition:.3s;}
+    .slot-lbl{font-size:12.5px;font-weight:600;}
+    .slot-count{font-size:11px;color:var(--cardio);}
+    .slot-tag{font-family:'JetBrains Mono';font-size:8px;letter-spacing:.1em;color:var(--dim);
+      text-transform:uppercase;}
+    .slot-done .slot-lbl{color:var(--text);}
+
+    /* start buttons */
+    .start-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+    .start-btn{grid-column:span 1;background:var(--panel2);border:1px solid var(--line);
+      border-left:3px solid var(--a);border-radius:13px;padding:14px 13px;text-align:left;
+      cursor:pointer;position:relative;transition:.2s;color:var(--text);}
+    .start-btn.wide{grid-column:span 2;}
+    .start-btn:hover{background:#ffffff0a;transform:translateY(-1px);}
+    .start-title{display:block;font-family:'Space Grotesk';font-weight:600;font-size:15px;}
+    .start-sub{display:block;font-size:11.5px;color:var(--muted);margin-top:2px;}
+    .start-arrow{position:absolute;right:13px;top:50%;transform:translateY(-50%);color:var(--a);font-size:17px;}
+
+    /* walk */
+    .walk-card{display:flex;justify-content:space-between;align-items:center;}
+    .walk-meta{display:flex;align-items:baseline;gap:9px;}
+    .walk-count{font-size:34px;font-weight:700;color:var(--walk);line-height:1;}
+    .walk-lbl{font-size:12px;color:var(--muted);}
+    .walk-streak{font-size:11.5px;color:var(--dim);margin-top:7px;}
+    .walk-btns{display:flex;gap:9px;}
+    .round{width:44px;height:44px;border-radius:50%;border:1px solid var(--line);
+      background:var(--panel2);color:var(--text);font-size:22px;cursor:pointer;line-height:1;}
+    .round:disabled{opacity:.3;cursor:default;}
+    .round.plus{background:var(--walk);color:var(--ink);border-color:var(--walk);font-weight:700;
+      box-shadow:0 0 16px #79C57B44;}
+
+    /* flags */
+    .flags ul{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:9px;}
+    .flags li{font-size:12.5px;color:var(--muted);line-height:1.45;padding-left:14px;position:relative;}
+    .flags li:before{content:"›";position:absolute;left:0;color:var(--load);font-weight:700;}
+
+    /* sheet / logger */
+    .sheet-scrim{position:fixed;inset:0;background:#000a;z-index:50;display:flex;
+      align-items:flex-end;justify-content:center;backdrop-filter:blur(2px);}
+    .sheet{background:var(--ink);width:100%;max-width:520px;max-height:94vh;border-radius:20px 20px 0 0;
+      border-top:1px solid var(--line);display:flex;flex-direction:column;animation:up .28s ease;}
+    @keyframes up{from{transform:translateY(30px);opacity:.6;}}
+    .sheet-head{display:flex;align-items:center;justify-content:space-between;padding:15px 16px 8px;}
+    .sheet-titles{text-align:center;}
+    .sheet-title{font-family:'Space Grotesk';font-weight:700;font-size:17px;}
+    .sheet-sub{font-size:10.5px;color:var(--muted);letter-spacing:.08em;}
+    .sheet-cancel{background:none;border:none;color:var(--muted);font-size:14px;cursor:pointer;font-family:'Inter';}
+    .sheet-save{background:var(--load);border:none;color:var(--ink);font-weight:700;
+      padding:8px 17px;border-radius:9px;font-size:14px;cursor:pointer;font-family:'Inter';}
+    .sheet-date{display:flex;align-items:center;gap:10px;padding:2px 18px 10px;border-bottom:1px solid var(--line);}
+    .sheet-date label{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);}
+    .sheet-date input{background:var(--panel2);border:1px solid var(--line);color:var(--text);
+      border-radius:8px;padding:6px 9px;font-family:'JetBrains Mono';font-size:13px;color-scheme:dark;}
+    .sheet-body{overflow-y:auto;padding:14px 16px 26px;display:flex;flex-direction:column;gap:12px;}
+
+    .ex-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;}
+    .ex-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:10px;}
+    .ex-slot{font-size:9.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--dim);}
+    .ex-name{font-family:'Space Grotesk';font-weight:600;font-size:15px;margin-top:3px;}
+    .phase-toggle{display:flex;background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:2px;flex-shrink:0;}
+    .phase-toggle button{background:none;border:none;color:var(--muted);font-size:11px;padding:5px 9px;
+      border-radius:7px;cursor:pointer;font-family:'JetBrains Mono';}
+    .phase-toggle button.on{background:var(--load);color:var(--ink);font-weight:700;}
+    .ex-target{font-size:11px;color:var(--muted);margin-bottom:11px;}
+    .ex-prev{color:var(--dim);}
+
+    .sets{display:flex;flex-direction:column;gap:7px;}
+    .set-row{display:grid;grid-template-columns:34px 1fr 1fr 1fr;gap:8px;align-items:center;}
+    .set-head{color:var(--dim);font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;}
+    .set-head span{text-align:center;}
+    .set-i{color:var(--dim);text-align:center;font-size:13px;}
+    .num{background:var(--panel2);border:1px solid var(--line);color:var(--text);
+      border-radius:8px;padding:9px 4px;text-align:center;font-size:15px;width:100%;
+      -moz-appearance:textfield;}
+    .num::-webkit-outer-spin-button,.num::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+    .num:focus{outline:none;border-color:var(--load);background:#E9A23B12;}
+    .num-big{font-size:30px;padding:12px;width:120px;}
+    .squash-min{display:flex;align-items:center;gap:12px;margin-bottom:12px;}
+    .squash-min .mono{color:var(--muted);font-size:14px;}
+    .note{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--text);
+      border-radius:10px;padding:11px;font-family:'Inter';font-size:14px;resize:vertical;min-height:64px;}
+    .note:focus{outline:none;border-color:var(--cardio);}
+
+    /* progress */
+    .ex-select{width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--text);
+      border-radius:10px;padding:11px;font-size:13px;margin-bottom:14px;color-scheme:dark;}
+    .prog-readout{display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:10px;}
+    .ro-big{font-size:38px;font-weight:700;color:var(--load);line-height:1;}
+    .ro-unit{font-size:17px;color:var(--muted);margin-left:2px;}
+    .ro-lbl{font-size:11px;color:var(--dim);}
+    .ro-delta{font-size:16px;color:var(--muted);text-align:right;}
+    .ro-delta.up{color:var(--walk);}
+    .ro-delta.down{color:var(--alert);}
+    .muted-p{color:var(--muted);font-size:13px;margin:4px 0 0;}
+
+    .ready{border-color:#79C57B44;}
+    .ready-sub{font-size:12.5px;color:var(--muted);margin:0 0 12px;line-height:1.4;}
+    .ready-list{display:flex;flex-wrap:wrap;gap:8px;}
+    .ready-chip{background:#79C57B14;border:1px solid #79C57B44;border-radius:9px;
+      padding:8px 11px;font-size:12px;display:flex;flex-direction:column;gap:2px;}
+    .ready-add{color:var(--walk);font-weight:700;font-size:11px;}
+
+    /* history */
+    .hist{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;}
+    .hist-head{width:100%;background:none;border:none;display:flex;align-items:center;gap:12px;
+      padding:14px;cursor:pointer;color:var(--text);text-align:left;}
+    .hist-bar{width:3px;align-self:stretch;background:var(--a);border-radius:2px;}
+    .hist-main{flex:1;}
+    .hist-title{font-family:'Space Grotesk';font-weight:600;font-size:15px;}
+    .hist-meta{font-size:11px;color:var(--muted);margin-top:2px;}
+    .hist-caret{color:var(--dim);font-size:13px;}
+    .hist-body{padding:0 14px 14px;border-top:1px solid var(--line);}
+    .hist-ex{padding:9px 0;border-bottom:1px solid #ffffff08;}
+    .hist-ex-name{font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px;margin-bottom:4px;}
+    .hist-phase{font-size:9px;color:var(--dim);border:1px solid var(--line);border-radius:5px;padding:1px 5px;}
+    .hist-sets{display:flex;flex-wrap:wrap;gap:9px;font-size:12px;color:var(--muted);}
+    .hist-note{color:var(--muted);font-size:13px;padding:11px 0;}
+    .hist-del{background:none;border:1px solid #E4573D44;color:var(--alert);border-radius:8px;
+      padding:7px 12px;font-size:12px;cursor:pointer;margin-top:11px;font-family:'Inter';}
+
+    /* tooltip */
+    .tip{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-size:11px;}
+    .tip-date{color:var(--dim);margin-bottom:3px;}
+    .tip-val{color:var(--load);font-size:15px;font-weight:700;}
+    .tip-detail{color:var(--muted);margin-top:3px;}
+
+    /* empty */
+    .empty{text-align:center;padding:56px 24px;}
+    .empty-mark{width:34px;height:34px;margin:0 auto 16px;border-radius:9px;
+      background:linear-gradient(var(--load),var(--cardio));opacity:.5;}
+    .empty-title{font-family:'Space Grotesk';font-weight:600;font-size:17px;margin-bottom:7px;}
+    .empty-body{color:var(--muted);font-size:13px;line-height:1.5;max-width:280px;margin:0 auto;}
+
+    /* nav */
+    .nav{position:fixed;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:520px;
+      display:flex;background:var(--panel);border-top:1px solid var(--line);z-index:40;}
+    .nav button{flex:1;background:none;border:none;color:var(--dim);padding:15px 0 18px;
+      font-size:12.5px;font-weight:600;cursor:pointer;font-family:'Inter';position:relative;}
+    .nav button.nav-on{color:var(--text);}
+    .nav button.nav-on:before{content:"";position:absolute;top:0;left:50%;transform:translateX(-50%);
+      width:26px;height:2.5px;background:var(--load);border-radius:0 0 3px 3px;}
+
+    @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;}}
+    `}</style>
+  );
+}
+
+
+// Ask iOS/Chrome to keep storage durable (reduces eviction; not guaranteed on iOS)
+if (navigator.storage && navigator.storage.persist) { navigator.storage.persist(); }
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

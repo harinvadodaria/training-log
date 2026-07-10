@@ -345,12 +345,12 @@ const {
 } = Recharts;
 
 /* ============================================================
-   Harin — Training Tracker
+   fitness — Training Tracker
    Data model persisted to window.storage under one key.
    Design: "instrument panel" — data-forward, protect-the-lift.
    ============================================================ */
 
-const STORAGE_KEY = "harin-tracker-v1";
+const STORAGE_KEY = "fitness-tracker-v1";
 
 /* ---------- Exercise templates (from plan PDF) ---------- */
 const SESSIONS = {
@@ -563,7 +563,7 @@ const emptyState = () => ({
     sports: []
   }
 });
-const IDB_NAME = "harin-tracker";
+const IDB_NAME = "fitness-tracker";
 const IDB_STORE = "kv";
 let _idb; // cached connection promise — avoid reopen per read/write
 function idbOpen() {

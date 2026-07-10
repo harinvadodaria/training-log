@@ -661,13 +661,22 @@ function readyToProgress(sessions, exKey) {
   }
   return false;
 }
+/* walks[date] is an array of { minutes }. Older data stored a plain count
+   (number); normalize on read so nothing on disk needs rewriting. */
+const walkArr = v => Array.isArray(v) ? v : typeof v === "number" ? Array.from({
+  length: v
+}, () => ({
+  minutes: 0
+})) : [];
+const walkCount = v => walkArr(v).length;
+const walkMinutes = v => walkArr(v).reduce((t, w) => t + (w.minutes || 0), 0);
 function walkStreak(walks) {
   let n = 0;
   const d = new Date();
   // allow "today not yet done" without breaking streak
-  if (!walks[iso(d)]) d.setDate(d.getDate() - 1);
+  if (!walkCount(walks[iso(d)])) d.setDate(d.getDate() - 1);
   for (;;) {
-    if (walks[iso(d)] > 0) {
+    if (walkCount(walks[iso(d)]) > 0) {
       n++;
       d.setDate(d.getDate() - 1);
     } else break;
@@ -755,13 +764,26 @@ function App() {
     ...state,
     sessions: state.sessions.filter(x => x.id !== id)
   });
-  const bumpWalk = delta => {
+  const addWalk = minutes => {
     const t = todayISO();
-    const n = Math.max(0, (state.walks[t] || 0) + delta);
+    const arr = [...walkArr(state.walks[t]), {
+      minutes: num(minutes)
+    }];
+    commit({
+      ...state,
+      walks: {
+        ...state.walks,
+        [t]: arr
+      }
+    });
+  };
+  const removeWalk = idx => {
+    const t = todayISO();
+    const arr = walkArr(state.walks[t]).filter((_, i) => i !== idx);
     const walks = {
       ...state.walks
     };
-    if (n === 0) delete walks[t];else walks[t] = n;
+    if (arr.length) walks[t] = arr;else delete walks[t];
     commit({
       ...state,
       walks
@@ -827,7 +849,8 @@ function App() {
   }, tab === "today" && /*#__PURE__*/React.createElement(Today, {
     state: state,
     onStart: setLogType,
-    bumpWalk: bumpWalk,
+    addWalk: addWalk,
+    removeWalk: removeWalk,
     setBodyweight: setBodyweight
   }), tab === "progress" && /*#__PURE__*/React.createElement(Progress, {
     state: state
@@ -944,12 +967,11 @@ function Header({
 function Today({
   state,
   onStart,
-  bumpWalk,
+  addWalk,
+  removeWalk,
   setBodyweight
 }) {
   const wk = useMemo(() => weekStats(state.sessions, todayISO()), [state.sessions]);
-  const streak = useMemo(() => walkStreak(state.walks), [state.walks]);
-  const walksToday = state.walks[todayISO()] || 0;
   const tier = TIERS[wk.tier];
   return /*#__PURE__*/React.createElement("div", {
     className: "stack"
@@ -1000,9 +1022,32 @@ function Today({
     sub: "Cardio · min + note",
     onClick: () => onStart(sp.key),
     wide: true
-  })))), /*#__PURE__*/React.createElement("section", {
-    className: "card walk-card"
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  })))), /*#__PURE__*/React.createElement(WalkCard, {
+    walks: state.walks,
+    onAdd: addWalk,
+    onRemove: removeWalk
+  }), /*#__PURE__*/React.createElement(BodyweightCard, {
+    bodyweight: state.bodyweight || {},
+    onSet: setBodyweight
+  }), /*#__PURE__*/React.createElement(PlanFlags, null));
+}
+function WalkCard({
+  walks,
+  onAdd,
+  onRemove
+}) {
+  const t = todayISO();
+  const today = walkArr(walks[t]);
+  const streak = useMemo(() => walkStreak(walks), [walks]);
+  const totalMin = today.reduce((s, w) => s + (w.minutes || 0), 0);
+  const [min, setMin] = useState("");
+  const add = () => {
+    onAdd(min);
+    setMin("");
+  };
+  return /*#__PURE__*/React.createElement("section", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
     className: "card-eyebrow",
     style: {
       color: "var(--walk)"
@@ -1011,23 +1056,31 @@ function Today({
     className: "walk-meta"
   }, /*#__PURE__*/React.createElement("span", {
     className: "walk-count mono"
-  }, walksToday), /*#__PURE__*/React.createElement("span", {
+  }, today.length), /*#__PURE__*/React.createElement("span", {
     className: "walk-lbl"
-  }, "today")), /*#__PURE__*/React.createElement("div", {
-    className: "walk-streak mono"
-  }, streak > 0 ? `${streak}-day streak` : "start a streak")), /*#__PURE__*/React.createElement("div", {
-    className: "walk-btns"
-  }, /*#__PURE__*/React.createElement("button", {
-    className: "round",
-    onClick: () => bumpWalk(-1),
-    disabled: walksToday === 0
-  }, "−"), /*#__PURE__*/React.createElement("button", {
-    className: "round plus",
-    onClick: () => bumpWalk(1)
-  }, "+"))), /*#__PURE__*/React.createElement(BodyweightCard, {
-    bodyweight: state.bodyweight || {},
-    onSet: setBodyweight
-  }), /*#__PURE__*/React.createElement(PlanFlags, null));
+  }, "today", totalMin ? ` · ${totalMin} min` : ""), /*#__PURE__*/React.createElement("span", {
+    className: "walk-streak mono",
+    style: {
+      marginLeft: "auto"
+    }
+  }, streak > 0 ? `${streak}-day streak` : "start a streak")), today.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "walk-chips"
+  }, today.map((w, i) => /*#__PURE__*/React.createElement("span", {
+    className: "walk-chip mono",
+    key: i
+  }, w.minutes ? `${w.minutes} min` : "walk", /*#__PURE__*/React.createElement("button", {
+    onClick: () => onRemove(i),
+    "aria-label": "remove walk"
+  }, "✕")))), /*#__PURE__*/React.createElement("div", {
+    className: "walk-add"
+  }, /*#__PURE__*/React.createElement(NumInput, {
+    value: min,
+    onChange: setMin,
+    placeholder: "min (optional)"
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "walk-add-btn",
+    onClick: add
+  }, "＋ Add walk")));
 }
 function TierGauge({
   wk,
@@ -2212,6 +2265,15 @@ function Style() {
 
     /* walk */
     .walk-card{display:flex;justify-content:space-between;align-items:center;}
+    .walk-chips{display:flex;flex-wrap:wrap;gap:7px;margin:12px 0 4px;}
+    .walk-chip{display:flex;align-items:center;gap:7px;background:#79C57B14;
+      border:1px solid #79C57B44;border-radius:9px;padding:6px 6px 6px 10px;font-size:12px;color:var(--text);}
+    .walk-chip button{background:none;border:none;color:var(--walk);font-size:11px;cursor:pointer;
+      width:18px;height:18px;line-height:1;}
+    .walk-add{display:flex;gap:8px;margin-top:12px;}
+    .walk-add .num{width:110px;}
+    .walk-add-btn{flex:1;background:var(--walk);border:none;color:var(--ink);font-weight:700;
+      border-radius:9px;padding:11px;font-size:14px;cursor:pointer;font-family:'Inter';}
     .bw-entry{display:flex;flex-direction:column;gap:8px;align-items:flex-end;}
     .bw-entry .num{width:96px;}
     .bw-save{background:var(--cardio);border:none;color:var(--ink);font-weight:700;
